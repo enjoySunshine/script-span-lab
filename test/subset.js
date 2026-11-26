@@ -132,6 +132,70 @@ describe('font subsetting', function () {
         }
       });
     });
+
+    describe('variation instance subsets', function () {
+      let font = fontkit.openSync(
+        new URL('data/Playwrite/Playwrite-MM-Subset.ttf', import.meta.url),
+      );
+
+      function subsetChar(instance, char) {
+        let subset = instance.createSubset();
+        subset.includeGlyph(instance.glyphForCodePoint(char.codePointAt(0)));
+        return fontkit.create(subset.encode());
+      }
+
+      it('bakes the instance advance width and outline into the subset', function () {
+        let f = subsetChar(font.getVariation('Maximum'), 'A');
+        let glyph = f.glyphForCodePoint(0x41);
+
+        assert.equal(glyph.id, 1);
+        assert.equal(glyph.advanceWidth, 1162);
+        assert.equal(glyph.path.toSVG().length, 275);
+        assert.ok(glyph.path.toSVG().startsWith('M5 -14'));
+        assert.equal(f.getGlyph(1).path.toSVG(), glyph.path.toSVG());
+      });
+
+      it('keeps the default advance width and outline without variations', function () {
+        let f = subsetChar(font, 'A');
+        let glyph = f.glyphForCodePoint(0x41);
+
+        assert.equal(glyph.advanceWidth, 750);
+        assert.equal(glyph.path.toSVG().length, 254);
+        assert.ok(glyph.path.toSVG().startsWith('M44 -12'));
+      });
+
+      it('follows the numbers of whichever instance is subset', function () {
+        for (let name of Object.keys(font.namedVariations)) {
+          let instance = font.getVariation(name);
+          let expected = instance.glyphForCodePoint(0x41);
+          let glyph = subsetChar(instance, 'A').glyphForCodePoint(0x41);
+
+          assert.equal(glyph.advanceWidth, expected.advanceWidth, name);
+          assert.equal(glyph.path.toSVG(), expected.path.toSVG(), name);
+        }
+      });
+
+      it('maps the subset characters back to their glyphs', function () {
+        let f = subsetChar(font.getVariation('Maximum'), 'A');
+
+        assert.ok(f.hasGlyphForCodePoint(0x41));
+        assert.deepEqual(f.characterSet, [0x41]);
+        assert.equal(f.glyphForCodePoint(0x41).id, 1);
+        assert.equal(f.glyphForCodePoint(0x42).id, 0);
+      });
+
+      it('bakes the varied global metrics into the subset', function () {
+        let instance = font.getVariation('Maximum');
+        let f = subsetChar(instance, 'A');
+
+        assert.equal(f.ascent, Math.round(instance.ascent));
+        assert.equal(f.descent, Math.round(instance.descent));
+        assert.equal(
+          f.underlinePosition,
+          Math.round(instance.underlinePosition),
+        );
+      });
+    });
   });
 
   describe('CFF subsetting', function () {

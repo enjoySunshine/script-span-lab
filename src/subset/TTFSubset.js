@@ -42,12 +42,132 @@ export default class TTFSubset extends Subset {
     this.loca.offsets.push(this.offset);
 
     this.hmtx.metrics.push({
-      advance: glyph.advanceWidth,
+      // varied advances interpolate to floats; hmtx stores whole units
+      advance: Math.round(glyph.advanceWidth),
       bearing,
     });
 
     this.offset += buffer.length;
     return this.glyf.length - 1;
+  }
+
+  // A post table without glyph names, so the subset stands alone:
+  // font-wide metrics such as the underline position read from it.
+  // Values come from the font's metrics, with any MVAR variation
+  // adjustments already applied.
+  _postTable() {
+    let { post } = this.font;
+    let metrics = post ? this.font._getMetrics() : null;
+
+    return {
+      version: 3,
+      italicAngle: post ? post.italicAngle : 0,
+      underlinePosition: metrics ? Math.round(metrics.underlinePosition) : 0,
+      underlineThickness: metrics ? Math.round(metrics.underlineThickness) : 0,
+      isFixedPitch: post ? post.isFixedPitch : 0,
+      minMemType42: 0,
+      maxMemType42: 0,
+      minMemType1: 0,
+      maxMemType1: 0,
+    };
+  }
+
+  // A cmap mapping the subset's characters to their new glyph ids.
+  _cmapTable() {
+    let pairs = Object.keys(this.cmap)
+      .map((codePoint) => [Number(codePoint), this.cmap[codePoint]])
+      .sort((a, b) => a[0] - b[0]);
+
+    // Merge runs of consecutive code points mapped to consecutive glyphs.
+    let segments = [];
+    for (let [codePoint, gid] of pairs) {
+      let last = segments[segments.length - 1];
+      if (last && codePoint === last.end + 1 && gid === last.lastGid + 1) {
+        last.end = codePoint;
+        last.lastGid = gid;
+      } else {
+        segments.push({
+          start: codePoint,
+          end: codePoint,
+          startGid: gid,
+          lastGid: gid,
+        });
+      }
+    }
+
+    // Format 12 covers code points beyond the basic multilingual plane.
+    if (pairs.length > 0 && pairs[pairs.length - 1][0] > 0xffff) {
+      return {
+        version: 0,
+        numSubtables: 1,
+        tables: [
+          {
+            platformID: 3,
+            encodingID: 10,
+            table: {
+              version: 12,
+              length: 16 + 12 * segments.length,
+              language: 0,
+              nGroups: segments.length,
+              groups: segments.map((segment) => ({
+                startCharCode: segment.start,
+                endCharCode: segment.end,
+                glyphID: segment.startGid,
+              })),
+            },
+          },
+        ],
+      };
+    }
+
+    // Format 4 ends with a required segment mapping 0xffff to glyph 0.
+    segments.push({ start: 0xffff, end: 0xffff, startGid: 0 });
+
+    let segCount = segments.length;
+    let maxPowerOf2 = Math.pow(2, Math.floor(Math.log2(segCount)));
+
+    let endCode = [];
+    let startCode = [];
+    let idDelta = [];
+    let idRangeOffset = [];
+    for (let segment of segments) {
+      endCode.push(segment.end);
+      startCode.push(segment.start);
+
+      // (codePoint + delta) must give the glyph id, modulo 65536.
+      let delta = (segment.startGid - segment.start) & 0xffff;
+      if (delta >= 0x8000) {
+        delta -= 0x10000;
+      }
+
+      idDelta.push(delta);
+      idRangeOffset.push(0);
+    }
+
+    return {
+      version: 0,
+      numSubtables: 1,
+      tables: [
+        {
+          platformID: 3,
+          encodingID: 1,
+          table: {
+            version: 4,
+            length: 16 + 8 * segCount,
+            language: 0,
+            segCountX2: segCount * 2,
+            searchRange: maxPowerOf2 * 2,
+            entrySelector: Math.log2(maxPowerOf2),
+            rangeShift: segCount * 2 - maxPowerOf2 * 2,
+            endCode,
+            startCode,
+            idDelta,
+            idRangeOffset,
+            glyphIndexArray: [],
+          },
+        },
+      ],
+    };
   }
 
   encode() {
@@ -88,27 +208,14 @@ export default class TTFSubset extends Subset {
     let hhea = { ...this.font.hhea };
     hhea.numberOfMetrics = this.hmtx.metrics.length;
 
-    // map = []
-    // for index in [0...256]
-    //     if index < @numGlyphs
-    //         map[index] = index
-    //     else
-    //         map[index] = 0
-    //
-    // cmapTable =
-    //     version: 0
-    //     length: 262
-    //     language: 0
-    //     codeMap: map
-    //
-    // cmap =
-    //     version: 0
-    //     numSubtables: 1
-    //     tables: [
-    //         platformID: 1
-    //         encodingID: 0
-    //         table: cmapTable
-    //     ]
+    if (this.font._variationProcessor) {
+      // Bake the varied global metrics into the subset, so it works as a
+      // static instance without the variation tables.
+      let metrics = this.font._getMetrics();
+      hhea.ascent = Math.round(metrics.ascent);
+      hhea.descent = Math.round(metrics.descent);
+      hhea.lineGap = Math.round(metrics.lineGap);
+    }
 
     // TODO: subset prep, cvt, fpgm?
     return Directory.toBuffer({
@@ -122,11 +229,11 @@ export default class TTFSubset extends Subset {
         glyf: this.glyf,
         hmtx: this.hmtx,
         fpgm: this.font.fpgm,
+        cmap: this._cmapTable(),
+        post: this._postTable(),
 
         // name: clone @font.name
         // 'OS/2': clone @font['OS/2']
-        // post: clone @font.post
-        // cmap: cmap
       },
     });
   }
